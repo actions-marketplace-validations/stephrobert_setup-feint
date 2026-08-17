@@ -72,6 +72,40 @@ jobs:
           test "$(feint version)" = "v${FEINT_VERSION}"
           test "${SCW_API_URL}" = "${ENDPOINT}"
 
+  # `uses: stephrobert/setup-feint@v1` is the line people copy, and issue #245
+  # in the source repository requires it proven "in a workflow outside this
+  # repository" — this repository is outside that one, and this job consumes
+  # the published reference exactly as a stranger's pipeline would: by the
+  # floating tag, with no checkout at all. Deliberately not pinned to a SHA,
+  # against the convention every other `uses:` here follows, because the
+  # resolution of the `v1` tag is the thing under test.
+  published:
+    name: The published @v1 reference works from a foreign workflow
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions: {}
+    steps:
+      - name: Harden the runner
+        uses: step-security/harden-runner@bf7454d06d71f1098171f2acdf0cd4708d7b5920 # v2.20.0
+        with:
+          egress-policy: audit
+
+      - name: Set up Feint via the published reference
+        id: setup
+        uses: stephrobert/setup-feint@v1 # zizmor: ignore[unpinned-uses] -- the tag's resolution is the subject under test
+        with:
+          version: ${{ env.FEINT_VERSION }}
+          provider: scaleway
+
+      - name: The emulator answers, and the client environment is exported
+        env:
+          ENDPOINT: ${{ steps.setup.outputs.endpoint }}
+        run: |
+          set -euo pipefail
+          curl -sf "${ENDPOINT}/_feint/health" > /dev/null
+          test "$(feint version)" = "v${FEINT_VERSION}"
+          test "${SCW_API_URL}" = "${ENDPOINT}"
+
   refusal:
     name: A tampered download is refused, and nothing runs
     runs-on: ubuntu-24.04
