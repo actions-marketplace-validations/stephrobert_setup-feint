@@ -1,0 +1,153 @@
+# The CI of a mirror, and nothing else.
+#
+# The action's source of truth is stephrobert/feint
+# (.github/actions/setup-feint/action.yml), where it is reviewed and gated;
+# this repository exists because the Marketplace requires action.yml at a
+# repository root. A job in the source repository's "Workflow security"
+# workflow fails every pull request there while the file this repository
+# serves at `v1` differs from the source — that is the drift gate, and it is
+# not here.
+#
+# What that gate cannot prove is that the published action still works, and
+# above all that its checksum verification still refuses. A verification that
+# quietly stops verifying makes nothing fail anywhere — the honest run stays
+# green with or without it — so the refusal is the one property that must be
+# exercised, not trusted. Both legs run on every push and once a week: the
+# weekly run is what notices a rot that no commit caused, such as a change in
+# the release asset layout upstream.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: '17 6 * * 1'
+  workflow_dispatch:
+
+permissions: {}
+
+env:
+  # A released version of stephrobert/feint. Any released version proves the
+  # mechanism; this one is pinned rather than "latest" because a mutable
+  # reference installs a binary nobody can name afterwards.
+  FEINT_VERSION: "0.8.0"
+
+jobs:
+  install:
+    name: The action installs, and the emulator answers
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: Harden the runner
+        uses: step-security/harden-runner@bf7454d06d71f1098171f2acdf0cd4708d7b5920 # v2.20.0
+        with:
+          egress-policy: audit
+
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Feint
+        id: setup
+        uses: ./
+        with:
+          version: ${{ env.FEINT_VERSION }}
+          provider: scaleway
+
+      # Three assertions, each on a different promise of the action: the
+      # emulator answers on the endpoint output, the binary on PATH is the
+      # release that was asked for (`feint version` prints the tag), and the
+      # provider environment reached this step through GITHUB_ENV.
+      - name: The emulator answers, and the client environment is exported
+        env:
+          ENDPOINT: ${{ steps.setup.outputs.endpoint }}
+        run: |
+          set -euo pipefail
+          curl -sf "${ENDPOINT}/_feint/health" > /dev/null
+          test "$(feint version)" = "v${FEINT_VERSION}"
+          test "${SCW_API_URL}" = "${ENDPOINT}"
+
+  refusal:
+    name: A tampered download is refused, and nothing runs
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: Harden the runner
+        uses: step-security/harden-runner@bf7454d06d71f1098171f2acdf0cd4708d7b5920 # v2.20.0
+        with:
+          egress-policy: audit
+
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # The action's own download step is made to fetch corrupted bytes, by
+      # putting a pass-through curl ahead of the real one on PATH. It flips one
+      # byte of any feint binary it just downloaded and leaves checksums.txt
+      # genuine: exactly the mismatch the verification exists to catch, applied
+      # to the action as shipped rather than to a copy of its script. The two
+      # markers are what make a red on this job diagnosable — they prove both
+      # downloads succeeded, so the only thing left to fail is the check.
+      - name: Put a byte-flipping curl ahead of the real one
+        run: |
+          set -euo pipefail
+          shimdir="${RUNNER_TEMP}/shim"
+          mkdir -p "${shimdir}"
+          cat > "${shimdir}/curl" <<'SHIM'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          out=""
+          prev=""
+          for arg in "$@"; do
+            if [ "${prev}" = "-o" ]; then out="${arg}"; fi
+            prev="${arg}"
+          done
+          /usr/bin/curl "$@"
+          case "$(basename "${out}")" in
+            feint-*)
+              printf 'x' >> "${out}"
+              : > "${RUNNER_TEMP}/binary-tampered"
+              ;;
+            checksums.txt)
+              : > "${RUNNER_TEMP}/checksums-served"
+              ;;
+          esac
+          SHIM
+          chmod +x "${shimdir}/curl"
+          echo "${shimdir}" >> "${GITHUB_PATH}"
+
+      - name: Set up Feint against the tampered download
+        id: tampered
+        continue-on-error: true
+        uses: ./
+        with:
+          version: ${{ env.FEINT_VERSION }}
+
+      # Refused means refused before anything ran: the step failed, no feint is
+      # on PATH, and nothing answers on the default address. If the verification
+      # ever rots into a comment, `outcome` comes back `success` and this job
+      # goes red — that is the entire reason this workflow exists.
+      - name: The action failed, and nothing was installed or started
+        env:
+          OUTCOME: ${{ steps.tampered.outcome }}
+        run: |
+          set -euo pipefail
+          test -f "${RUNNER_TEMP}/binary-tampered"
+          test -f "${RUNNER_TEMP}/checksums-served"
+          test "${OUTCOME}" = failure
+          if command -v feint > /dev/null; then
+            echo "a refused binary is still on PATH" >&2
+            exit 1
+          fi
+          if curl -sf http://127.0.0.1:4599/_feint/health > /dev/null; then
+            echo "an emulator is answering after a refused install" >&2
+            exit 1
+          fi
